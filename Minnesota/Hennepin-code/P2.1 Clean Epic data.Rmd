@@ -1,0 +1,158 @@
+
+---
+title: "P2.1 Clean Epic data"
+output:
+  html_document:
+    toc: true
+---
+
+Phase 2 - Notebook 1 (copied from Databricks, not all code may work correctly in other IDEs).
+
+This notebook cleans and transforms Epic data for patients identified in the Phase 1 data exchange. New records will be shared as part of Phase 2.
+
+**Author:** Nate Bean
+
+**Date created:** 04/24 -- **Last modified:** 10/24
+
+**Purpose:** Clean Epic data that will be sent to MDH through the Phase 2 FHIR data exchange. Emily will provide a new file monthly. The result of this script flows into "Identify updated syphilis cases".
+
+**Schedule:** Monthly
+
+
+```{r}
+remotes::install_github("ReverieNB/PHinfo")
+```
+
+
+```{r}
+library(tidyverse)
+library(PHinfo)
+library(janitor)
+library(arrow)
+```
+
+
+```{r}
+raw <- "/dbfs/mnt/phmdw/Raw/PublicHealth/PHCS/Syphilis Provisional/FHIR Epic data/"
+refined <- "/dbfs/mnt/phmdw/Refined/PublicHealth/InfectiousDiseases/SyphilisProvisional/Cleaned Epic Data/"
+
+new_file <- tibble(files = list.files(raw)) |>
+  mutate(mth = str_remove_all(files, "Syphilis match |\\.xlsx"),
+         yr = parse_number(mth),
+         mth = str_remove(mth, "\\s.*$"),
+         mthn = match(mth, month.name)) |>
+  filter(yr == max(yr),
+         mthn == max(mthn)) |>
+  pull(files)
+
+message(str_c("Most recent file: ", new_file))
+```
+
+
+```{r}
+#The base of this file is a list of MEDSS languages shared by Dan. These are sometimes formatted differently than the corresponding Epic and FHIR values.
+#Then, I added the corresponding FHIR language codes from the separate FHIR languages file (for languages we currently use). Can add more as needed.
+medss_languages <- read_csv(str_c(reference, "FHIR/medss_expected_languages.csv")) |>
+  filter(used == 1) |>
+  select(!used)
+
+gender_values <- read_csv(str_c(reference, "FHIR/fhir_medss_gender.csv"))
+
+orientation_values <- c("Straight, not Gay or Lesbian", "Gay or Lesbian", "Bisexual", "Something else", "Unknown")
+```
+
+The fields we need to send through FHIR:
+  - Treatment regimen
+  - Treatment date
+  - Gender identity
+  - Sexual orientation
+  - Gender of sex partners, last 12 months
+  - Preferred language
+
+Other data notes:
+- Not all matches reflected in the Epic data may contain medications for syphilis. There are a few different steps for identifying questionable cases:
+  - There are 3 fields that may indicate med is for syphilis - if anything syphilis-related is present in any field consider the mediciation to be for syphilis
+  - There are two different types of medication included - penecillin and doxy. Given the unique dosage, we can be confident pen medications are always for syphilis, even if not indicated.
+  - For the few remaining cases, (no info, Doxy prescribed), consider the length of time between diagnosis and medication. A long gap may indicate the med was not for the syphilis case.
+- For now, we've determined not to filter out suspect cases under the theory that they could just be very delayed treatments. MDH will investigate these cases.
+- Treatment info must be converted to a format that aligns with MEDSS. The info itself is not always perfect, so some transformations were made below to align the data with accepted syphilis treatments (in particular, to reflect that penicillin would be a 4mL dose administered either 1x or 3x).
+
+
+```{r}
+epic_raw <- readxl::read_xlsx(str_c(raw, new_file),
+                              sheet = "Raw data") |>
+  clean_names() |>
+  select(case_id = syp_id, treatment_regimen = description, treatment_date = syp_rx, sexual_orientation = sexual_orientation_epic, 
+         sex_partner_gender = partner_last_12mo_ra, preferred_language = language, gender = gender_identity_epic, everything()) |>
+  mutate(#no_disease_info = if_else(if_all(c(dx_name, annotation, medical_cond_name), ~is.na(.)), 1, 0), #could be used as part of a filter
+         across(where(is_dttm), as.Date),
+         treatment_regimen = if_else(treatment_regimen == "PENICILLIN G BENZATHINE 600000 UNIT/ML IM SUSY", "PENICILLIN G BENZATHINE 1200000 UNIT/2ML IM SUSY", treatment_regimen)) |> #A clinical data entry issue - should be 1200000
+  #filter(!(no_disease_info == 1 & str_detect(treatment_regimen, "DOXYCYCLINE") & days_to_trt > 100)) |> #see notes above
+  distinct(case_id, order_med_id, .keep_all = TRUE) |> #dupe order_med_id means it is the same med order and something else in the row has differing information. Filter.
+  mutate(
+    treatment_regimen = str_remove(treatment_regimen, " ORAL.*$"), #from 5/1/24 meeting with MDH epis - distinction between tabs/capsules not relevant so remove this info to simplify
+    #From Naomi W: We only stock Bicillin in 2mL syringes so: 1 each = 2ml (one syringe), 2 each = 4ml (two syringes) - although apparently this doesn't actually work too well, see below.
+    quantity = case_when(
+      quantity == "1 each" ~ "4 mL", #per long email chains with Naomi/Martha/MDH folks. doesn't totally make sense, but leads to the correct values
+      quantity == "2 each" ~ "4 mL",
+      .default = quantity),
+    treatment_regimen = paste(treatment_regimen, quantity, sep = ", "), #5/1/24 meeting - add the quantity values to the treatment
+    treatment_regimen = str_remove(treatment_regimen, ", NA"),
+
+    sexual_orientation = case_when(
+      sexual_orientation == "Heterosexual (or straight)" ~ "Straight, not Gay or Lesbian",
+      sexual_orientation == "Lesbian or Gay" ~ "Gay or Lesbian",
+      sexual_orientation == "Bisexual" ~ "Bisexual",
+      sexual_orientation == "Unknown" ~ "Unknown",
+      sexual_orientation == "Chose not to disclose" ~ "Unknown",
+      sexual_orientation == "Do Not Know" ~ "Unknown",
+      .default = sexual_orientation),
+
+    preferred_language = case_when(
+      preferred_language == "Can Not Answer" ~ "Unknown",
+      preferred_language == "Farsi (Persian)" ~ "Persian",
+      preferred_language == "Oromo" ~ "Oromo Afan",
+      preferred_language == "English" ~ "English American",
+      preferred_language == "Bengali" ~ "Bangla",
+      preferred_language == "Pashto" ~ "Pashto Pushto",
+      .default = preferred_language),
+
+    #These transformations are our best effort to map medications to acceptable MEDSS values
+    treatment_regimen = case_when(
+      str_detect(treatment_regimen, "DOXYCYCLINE") & str_detect(treatment_regimen, "\\, 28") ~ "DOXYCYCLINE_BID_14",
+      str_detect(treatment_regimen, "DOXYCYCLINE") & str_detect(treatment_regimen, "\\, 56") ~ "DOXYCYCLINE_BID_28",
+      #Penicillin is a bit more complicated. First 12 mL is three weekly injections. A single 2.4 is 4 mL
+      str_detect(treatment_regimen, "PENICILLIN G BENZATHINE") & str_detect(treatment_regimen, "\\, 12 mL") ~ "BENZATHINE_PENICILLIN_G_2_4M_1x3",
+      str_detect(treatment_regimen, "PENICILLIN G BENZATHINE") & str_detect(treatment_regimen, "\\, 4 mL") ~ "BENZATHINE_PENICILLIN_G_2_4M_1",
+      #below, convert 2 to 4 assuming it's a data entry issue. People should either receive 1 or 3 doses of 4mL. The 2 mL values are likely an entry error.
+      str_detect(treatment_regimen, "PENICILLIN G BENZATHINE") & str_detect(treatment_regimen, "\\, 2 mL") ~ "BENZATHINE_PENICILLIN_G_2_4M_1",
+      .default = str_c("OTHER_", treatment_regimen)),
+
+    sex_partner_gender = if_else(is.na(sex_partner_gender), "UNKNOWN", str_to_upper(sex_partner_gender)),
+    sex_partner_gender = str_replace(sex_partner_gender, "OTHER", "OTHER_GENDER")) |>
+  left_join(gender_values, by = "gender") |>
+  mutate(gender_code = if_else(gender_display == "not applicable", "NA", gender_code)) |>
+  left_join(medss_languages, by = c("preferred_language" = "language")) |>
+  #Data validation - if any of these expectations fail it means we have received a new value from Epic.
+  #In that case, adjust the code above and underlying files/acceptable values to integrate it into the new data.
+  #The final state of the new value must be consistent with an accepted MEDSS value, even if we must transform it from its original meaning
+  #For preferred language - adjust the code above to map the value to an acceptable MEDSS language value specified in the medss_expected_languages.csv file (if that's necessary, it could map already),
+  #and then edit that file to indicate that language is now "used". Save the file and re-run the script.
+  #Orientation/gender values must map to the values outlined earlier in the script. The values "Something else" and "ADDITIONAL_GENDER_IDENTITY" are the most obvious mappings for new values.
+  expect_values(list("preferred_language" = medss_languages$language,
+                     "sexual_orientation" = orientation_values,
+                     "gender_identity" = gender_values$gender_identity)) |>
+  check_expectations() |>
+  select(case_id, first_name, last_name = trimmed_last, dob, dx_date, treatment_regimen, treatment_date,
+         sexual_orientation, gender_identity, gender_code, gender_display, gender_text, gender_system,         
+         preferred_language, language_code, sex_partner_gender, order_med_id)
+
+#At this point, there are still some duplicate case ids when someone has multiple treatments
+glimpse(epic_raw)
+```
+
+
+```{r}
+write_parquet(epic_raw, str_c(refined, "fhir_epic_cleaned_", today(), ".parquet"))
+```
+

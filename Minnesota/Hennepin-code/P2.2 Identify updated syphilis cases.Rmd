@@ -1,0 +1,366 @@
+
+---
+title: "P2.2 Identify updated syphilis cases"
+output:
+  html_document:
+    toc: true
+---
+Phase 2 - Notebook 2 (copied from Databricks, not all code may work correctly in other IDEs).
+
+This notebook cleans and transforms Epic data for patients identified in the Phase 1 data exchange. New records will be shared as part of Phase 2.
+
+**Author:** Nate Bean
+
+**Date created:** 05/24 -- **Last modified:** 10/24
+
+**Purpose:** Using the cleaned Epic data, determine which records are new or have been updated. Save updated records, which will be turned into the new FHIR bundle that will be sent to MDH in the "Send updated FHIR bundle" notebook.
+
+**Schedule:** Monthly
+
+```{r}
+remotes::install_github("ReverieNB/PHinfo")
+```
+
+
+```{r}
+library(tidyverse)
+library(PHinfo)
+library(arrow)
+```
+
+
+```{r}
+raw <- "/dbfs/mnt/phmdw/Raw/PublicHealth/InfectiousDiseases/SyphilisProvisional/Daily Files/"
+refined <- "/dbfs/mnt/phmdw/Refined/PublicHealth/InfectiousDiseases/SyphilisProvisional/Cleaned Epic Data/"
+bt <- "/dbfs/mnt/phmdw/Refined/PublicHealth/InfectiousDiseases/SyphilisProvisional/FHIR Base Tables/"
+```
+
+
+```{r}
+medss_languages <- read_csv(str_c(reference, "FHIR/medss_expected_languages.csv")) |>
+  filter(used == 1) |>
+  select(!used)
+
+medss_treatments <- read_csv(str_c(reference, "FHIR/medss_treatment_values.csv"))
+  
+gender_values <- read_csv(str_c(reference, "FHIR/fhir_medss_gender.csv"))
+
+orientation_values <- c("Straight, not Gay or Lesbian", "Gay or Lesbian", "Bisexual", "Something else", "Unknown")
+partner_values <- c("Y", "N", "UNK")
+```
+
+**Steps for identifying changes in the spyhilis case data**:
+ - Read in the most recent base table. This table will include the data from the Phase 1 data exchange and Epic from the time of the previous month's data pull. The end result of this notebook will be a new, updated base table.
+ - Read in the current Phase 1 data. Use this to add new cases to the base table and update information for existing cases. However, changed records are not considered updates because they reflect data MDH already has. 
+- Read in the new Epic data and use the documented logic to identify and update fields with new information.
+
+```{r}
+#Identify most recent Phase 1 data
+new_file <- list.files(raw, pattern = "fhir_syphilis_data") |>
+  tibble(file = _) |>
+  mutate(date = ymd(str_remove_all(file, "^.*_|\\.csv"))) |>
+  filter(date == max(date)) |>
+  pull(file)
+
+message(new_file)
+
+phase1_table <- read_csv(str_c(raw, new_file),
+                        col_select = c(
+                          case_id = id, sex = gender, gender_detail, partner_female = Femalesexpartners, partner_male = Malesexpartners, 
+                          partner_transgender_fm = TransgenderFMsexpartners, partner_transgender_mf = TransgenderMFsexpartners,
+                          treatment_date = regimen_start_date, treatment_regimen),
+                        col_types = c(
+                          id = "c", 
+                          gender = "c",
+                          gender_detail = "c",
+                          Femalesexpartners = "c",
+                          Malesexpartners = "c",
+                          TransgenderFMsexpartners = "c",
+                          TransgenderMFsexpartners = "c",
+                          "SexPartners'genderunknown" = "c",
+                          regimen_start_date = "D",
+                          treatment_regimen = "c")) |>
+  mutate(
+    gender_temp = case_when(
+      gender_detail == "M_F" ~ "TRANSGENDER_WOMAN",
+      gender_detail == "F_M" ~ "TRANSGENDER_MAN",
+      sex == "female" ~ "FEMALE",
+      sex == "male" ~ "MALE",
+      sex == "other" ~ "ADDITIONAL_GENDER_IDENTITY",
+      .default = sex),
+
+    gd_temp = if_else(gender_temp == "ADDITIONAL_GENDER_IDENTITY", sex, "not applicable"),
+    gc_temp = case_when( #add some validation here to catch when new values are needed; maybe just check if complete
+      gd_temp == "not applicable" ~ "NA",
+      gd_temp == "other" ~ "OTH",
+      gd_temp == "Non-binary" ~ "NB",
+      .default = NA),
+    gs_temp = if_else(gd_temp == "not applicable", "http://terminology.hl7.org/CodeSystem/v3-NullFlavor", "https://www.hennepin.us/residents/health-medical/public-health"),
+
+    partner_transgender = if_else(partner_transgender_fm == "Y" | partner_transgender_mf == "Y", "Y", "UNKNOWN"),
+    partner_male = if_else(partner_male == "Y", "MALE", "UNKNOWN"),
+    partner_female = if_else(partner_female == "Y", "FEMALE", "UNKNOWN"),
+    sex_partner_gender_temp = str_c(partner_female, partner_male, partner_transgender, sep = ";"),
+    sex_partner_gender_temp = if_else(sex_partner_gender_temp == "UNKNOWN;UNKNOWN;UNKNOWN", "UNKNOWN", str_remove_all(sex_partner_gender_temp, ";UNKNOWN|UNKNOWN;")),
+    treatment_regimen = str_remove(treatment_regimen, ";;.*$"),
+    treatment_regimen = case_when(
+      is.na(treatment_regimen) ~ NA,
+      treatment_regimen %in% medss_treatments$code ~ treatment_regimen,
+      .default = str_c("OTHER_", treatment_regimen)),
+      
+    treatment_date_last_p1 = treatment_date) |>
+  select(case_id, gender_temp, gd_temp, gc_temp, gd_temp, gs_temp, sex_partner_gender_temp, treatment_date_last_p1, treatment_date, treatment_regimen) |>
+  nest(treatment_history_temp = c(treatment_date, treatment_regimen))
+
+glimpse(phase1_table)
+```
+
+
+```{r}
+#The base table captures the state of our information at the time of the last push.
+#The treatment information is saved separately from the rest of the data, so the two files need to be joined.
+bt_date <- tibble(file = list.files(bt, pattern = "^fhir_main")) |>
+  mutate(date = str_remove_all(file, "\\w+\\_\\w+\\_|\\.parquet"),
+         date = ymd(date)) |>
+  pull(date) |>
+  max()
+
+message(str_c("Using data from ", bt_date, " base table."))
+
+#Read in treatement and nest so that there's one row per ID
+trt_base <- read_parquet(str_c(bt, "fhir_treat_", bt_date, ".parquet")) |>
+  mutate(treatment_date_last_base = max(treatment_date), .by = case_id) |>
+  nest(treatment_history = c(treatment_date, treatment_regimen))
+
+base_table <- read_parquet(str_c(bt, "fhir_main_", bt_date, ".parquet")) |>
+  left_join(trt_base, by = "case_id") #|>
+  #distinct(case_id, .keep_all = TRUE) 
+```
+
+The Phase 1 updates are generally not that important because we only consider the data to be "updated" when there's a change to the Epic data. We wouldn't consider a record updated (and send it back to MDH) due to a change in the Phase 1 data because they already have that. In addition, this would also lead to problems when there are conflicting Phase 1 and Epic values. If the primary value matched the Epic data after the most recent push, changing it back to match P1 would then lead to the new Epic comparison changing it back to match that value. That would cause the record to be considered "updated" again, despite the same value being present as the last push.
+
+The reason we do make updates to the Phase 1 value are scenarios when both the Phase and Epic data are changed to the same new value. For instance, perhaps both gender values were "Unknown" but were then updated to "Male". In this scenario, we wouldn't need to consider the record updated because although the Epic data was updated it still matches MDH's original data. If we didn't make changes to the P1 data, we wouldn't know the Epic data wasn't an update. 
+
+```{r}
+#Combine with new Phase 1 data
+new_fhir_table <- base_table |>
+  full_join(phase1_table, by = "case_id") |>
+  #For cases new since the previous push, add information from the Phase 1 data exchange
+  mutate(new_case = if_else(is.na(gender), 1, 0),
+         case_modification_date = if_else(new_case == 1, today(), case_modification_date),
+         across(c(gender, gender_p1), ~if_else(new_case == 1, gender_temp, .)),
+         across(c(sex_partner_gender, sex_partner_gender_p1), ~if_else(new_case == 1, sex_partner_gender_temp, .)),
+         preferred_language = if_else(is.na(preferred_language), "Unknown", preferred_language),
+         sexual_orientation = if_else(is.na(sexual_orientation), "Unknown", sexual_orientation),
+         language_code = if_else(is.na(language_code), "unk", language_code),
+         gender_display = if_else(is.na(gender_display), gd_temp, gender_display),
+         gender_code = if_else(is.na(gender_code), gc_temp, gender_code),
+         gender_system = if_else(is.na(gender_system), gs_temp, gender_system),
+
+         update = if_else(treatment_date_last_p1 > treatment_date_last_base | gender_p1 != gender_temp | sex_partner_gender_p1 != sex_partner_gender_temp, 1, 0)) %>%
+  #Summary stats
+  pipe_print(str_c(. |> filter(new_case == 1) |> nrow(), " new cases added to the data.")) %>%
+  pipe_print(str_c(. |> filter(update == 1 & new_case != 1) |> nrow(), " cases with updated P1 data.")) |>
+  mutate(#Now, make the actual updates based on changes to the data.
+         #First, update the P1 value if it is different in the latest data file. This includes changes to "Unknown".
+         gender_p1 = if_else(gender_p1 != gender_temp, gender_temp, gender_p1),
+         sex_partner_gender_p1 = if_else(sex_partner_gender_p1 != sex_partner_gender_temp, sex_partner_gender_temp, sex_partner_gender_p1),
+
+         #Fill in missing values for new cases
+         across(c(gender_epic, sex_partner_gender_epic), ~if_else(is.na(.), "UNKNOWN", .)),
+
+         #Second, update the primary value if P1 was updated and there is no Epic value. 
+         gender_display = if_else(gender != gender_p1 & gender_epic == "UNKNOWN", gd_temp, gender_display),
+         gender_code = if_else(gender != gender_p1 & gender_epic == "UNKNOWN", gc_temp, gender_code),
+         gender_system = if_else(gender != gender_p1 & gender_epic == "UNKNOWN", gs_temp, gender_system),
+         gender = if_else(gender != gender_p1 & gender_epic == "UNKNOWN", gender_p1, gender),
+         sex_partner_gender = if_else(sex_partner_gender != sex_partner_gender_p1 & sex_partner_gender_epic == "UNKNOWN", sex_partner_gender_p1, sex_partner_gender),
+
+         #Update the nested treatment list to be the P1 data instead of previous Epic/P1 if the new date is greater than the most recent previous one
+         #I guess technically the new date could be greater than some, but it's not really important to drop them in this case so will just ignore that.
+         #I also assume this would be very rare.
+         trt_dt_flag = case_when( 
+           is.na(treatment_date_last_p1) ~ 0,
+           is.na(treatment_date_last_base) ~ 1,
+           treatment_date_last_p1 > treatment_date_last_base ~ 1,
+           .default = 0),
+         treatment_combined = if_else(trt_dt_flag == 1, treatment_history_temp, treatment_history),
+         max_date_fhir = if_else(trt_dt_flag == 1, treatment_date_last_p1, treatment_date_last_base)) |>
+  select(-contains("_temp"), -new_case, -contains("update"), -epic_match, -contains("date_last"), -treatment_history) |>
+  rename(treatment_history = treatment_combined) |>
+  #None of the core fields should have missing values. If there isn't a value, will be unknown or something similar
+  expect_missing(list(case_id = 0, gender = 0, sex_partner_gender = 0, preferred_language = 0, sexual_orientation = 0, treatment_history = 0)) |>
+  check_expectations()
+  
+glimpse(new_fhir_table)
+```
+
+
+```{r}
+#Identify newest cleaned data
+epic_files <- tibble(file = list.files(refined)) |>
+  mutate(date = str_remove_all(file, "fhir_epic_cleaned_|\\.parquet"),
+         date = ymd(date)) |>
+  arrange(desc(date))
+
+new_epic <- epic_files |> filter(date == max(date)) 
+previous_epic <- epic_files |> slice(2) 
+
+message(str_c("Using ", new_epic$file))
+
+#Read in file
+epic <- read_parquet(str_c(refined, new_epic$file)) |>
+  select(case_id, treatment_regimen_temp = treatment_regimen, treatment_date_temp = treatment_date, sexual_orientation_temp = sexual_orientation,
+         gender_temp = gender_identity, gd_temp = gender_display, gc_temp = gender_code, gs_temp = gender_system, preferred_language_temp = preferred_language, 
+         lc_temp = language_code, sex_partner_gender_temp = sex_partner_gender) |>
+  mutate(epic_match = 1,
+         case_id = as.character(case_id)) |>
+  mutate(max_date_epic = max(treatment_date_temp), .by = case_id) |>
+  nest(treatment_history_epic = c(treatment_regimen_temp, treatment_date_temp)) |> #nest for now, otherwise will have multiple rows per person
+  expect_unique("case_id") |>
+  expect_missing(list(case_id = 0, gender_temp = 0, sex_partner_gender_temp = 0, preferred_language_temp = 0, sexual_orientation_temp = 0)) |>
+  check_expectations()
+
+#Total # of cases matched to Epic data
+message(str_c(nrow(epic), " cases matched to Epic data."))
+
+#Total # of new cases
+existing_ids <- open_dataset(str_c(refined, new_epic$file)) |>
+   select(case_id) |>
+   collect() |>
+   pull(case_id) |>
+   unique()
+
+new_ids <- epic |>
+   filter(!case_id %in% existing_ids) |>
+   pull(case_id)
+
+message(str_c(length(new_ids), " new cases matched to Epic data."))
+```
+
+
+```{r}
+updated_table <- new_fhir_table |>
+  left_join(epic, by = "case_id") |>
+  mutate(
+    #Update gender info. First update the Epic field
+    gender_temp = if_else(is.na(gender_temp), "UNKNOWN", gender_temp), 
+    gender_epic = case_when(
+      gender_epic == gender_temp ~ gender_epic,
+      gender_temp == "UNKNOWN" ~ gender_epic,
+      gender_epic == "UNKNOWN" ~ gender_temp,
+      str_detect(gender_epic, "TRANSGENDER") ~ gender_epic, #always keep this value 
+      gender_temp %in% c("MALE", "FEMALE") & gender_epic == "ADDITIONAL_GENDER_IDENTITY" ~ gender_epic, #do not update, but would update if new gender is transgender
+      .default = gender_temp), #otherwise, choose epic data
+    #Now update the actual values
+    gender_update = case_when(
+      gender == gender_epic ~ 0,
+      gender_epic == "UNKNOWN" ~ 0,
+      gender == "UNKNOWN" ~ 1,
+      str_detect(gender, "TRANSGENDER") ~ 0,
+      gender_epic %in% c("MALE", "FEMALE") & gender == "ADDITIONAL_GENDER_IDENTITY" ~ 0,
+      .default = 1),
+    gender = if_else(gender_update == 1, gender_epic, gender),
+    gender_display = if_else(gender_update == 1, gd_temp, gender_display),
+    gender_code = if_else(gender_update == 1, gc_temp, gender_code),
+    gender_system = if_else(gender_update == 1, gs_temp, gender_system),
+
+    #Update sex partner gender. First update the Epic field
+    sex_partner_gender_temp = if_else(is.na(sex_partner_gender_temp), "UNKNOWN", sex_partner_gender_temp),
+    sex_partner_gender_epic = case_when(
+      sex_partner_gender_epic == sex_partner_gender_temp ~ sex_partner_gender_epic,
+      sex_partner_gender_temp == "UNKNOWN" ~ sex_partner_gender_epic,
+      sex_partner_gender_epic == "UNKNOWN" ~ sex_partner_gender_temp,
+      .default = sex_partner_gender_temp), #if value has changed and is not unknown, use new value
+    #Now update actual value
+    sex_partner_update = case_when(
+      sex_partner_gender == sex_partner_gender_epic ~ 0,
+      sex_partner_gender_epic == "UNKNOWN" ~ 0,
+      sex_partner_gender == "UNKNOWN" ~ 1,
+      #If value is part of Epic value, use Epic
+      str_detect(sex_partner_gender_epic, str_c("^", sex_partner_gender, ";")) ~ 1,
+      str_detect(sex_partner_gender_epic, str_c(";", sex_partner_gender, "$")) ~ 1,
+      str_detect(sex_partner_gender_epic, str_c(";", sex_partner_gender, ";")) ~ 1,
+      #This just leaves values that are completely different - i.e. male and female. In this case, use current Epic value
+      .default = 1),
+    sex_partner_gender = if_else(sex_partner_update == 1, sex_partner_gender_epic, sex_partner_gender),  
+
+    #Update preferred language if different from previous Epic data and not Unknown
+    preferred_language_temp = if_else(is.na(preferred_language_temp), "Unknown", preferred_language_temp),
+    language_update = if_else(preferred_language != preferred_language_temp & preferred_language_temp != "Unknown", 1, 0),
+    preferred_language = if_else(language_update == 1, preferred_language_temp, preferred_language),
+    language_code = if_else(language_update == 1, lc_temp, language_code),
+
+    #Update sexual orientation
+    sexual_orientation_temp = if_else(is.na(sexual_orientation_temp), "Unknown", sexual_orientation_temp),
+    sexual_orientation_update = if_else(sexual_orientation != sexual_orientation_temp & sexual_orientation_temp != "Unknown", 1, 0),
+    sexual_orientation = if_else(sexual_orientation_update == 1, sexual_orientation_temp, sexual_orientation)) |>
+  #Final data validation
+  expect_missing(list(case_id = 0, gender = 0, sex_partner_gender = 0, preferred_language = 0, sexual_orientation = 0, treatment_history = 0,
+                      gender_p1 = 0, sex_partner_gender_p1 = 0, gender_epic = 0, sex_partner_gender_epic = 0, treatment_history_epic = 0,
+                      gender_update = 0, sex_partner_update = 0, language_update = 0, sexual_orientation_update = 0)) |>
+  expect_values(list(gender = gender_values$gender_identity,
+                     sexual_orientation = orientation_values,
+                     preferred_language = medss_languages$language)) |>
+  expect_unique("case_id") |>
+  check_expectations()
+```
+
+
+```{r}
+final_table <- updated_table |>
+  #mutate(max_date_temp = map_vec(treatment_history_epic, function(x){x |> pull(treatment_date_temp) |> max()}))
+  mutate(#Identify updated treatment information
+         treatment_update = case_when(
+          is.na(max_date_epic) ~ 0,
+          is.na(max_date_fhir) ~ 1,
+          max_date_epic > max_date_fhir ~ 1,
+          .default = 0),
+         #Substitute updated Epic treatment info where available
+         treatment_final = if_else(treatment_update == 1, treatment_history_epic, treatment_history), #this would technically keep older cases as well
+         update_any = if_else(if_any(contains("update"), ~. == 1), 1, 0), #overall number of updated cases to share back
+         case_modification_date = if_else(update_any == 1, today(), case_modification_date)) |>
+  select(-contains("temp"), -treatment_history, -treatment_history_epic, -contains("max_date")) |>
+  rename(treatment_history = treatment_final)
+
+#Show number of updates to each field
+final_table |> 
+  summarise(across(contains("update"), sum)) |> 
+  display()
+
+#Use output below to make sure the changes are reasonable.
+```
+
+
+```{r}
+#Need to make sure new tables are only saved when it's time to actually send the data. Otherwise that would mess the change data up
+#For now, require manual confirmation based on month. When writing a new file, adjust the month to the current month you're writing the file for
+#If you wish to write a new file for an existing month, you can also change add_anyway to TRUE, but MAKE SURE TO CHANGE IT BACK AFTERWARD.
+current_month = "2024-11"
+add_anyway = FALSE
+
+#This IDs any files already present for the same month/year
+conflicting_files <- tibble(files = list.files(bt, pattern = "^fhir_")) |>
+  filter(str_detect(files, current_month)) |>
+  nrow()
+
+#If there aren't any current files, or you'd like to save new files anyway, this will save the data
+if (conflicting_files == 0 | add_anyway == TRUE){
+  final_table |>
+    select(-treatment_history) |>
+    write_parquet(str_c(bt, "fhir_main_", today(), ".parquet"))
+
+  final_table |>
+    select(case_id, update_any, treatment_history) |>
+    unnest(treatment_history) |>
+    write_parquet(str_c(bt, "fhir_treat_", today(), ".parquet"))
+
+  message(str_c("New base tables written, ", current_month))
+
+} else {
+
+  message(str_c("Base table already exists for ", current_month))
+
+}
+```
+

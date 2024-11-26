@@ -1,0 +1,207 @@
+
+---
+title: "P1.2 Clean Syphilis FHIR Data"
+output:
+  html_document:
+    toc: true
+---
+
+Phase 1 - Notebook 2 (copied from Databricks, not all code may work correctly in other IDEs).
+
+This notebook cleans and transforms newly downloaded FHIR data.
+
+**Author:** Nate Bean
+
+**Date created:** 11/23 -- **Last modified:** 11/23
+
+**Purpose:** Transform syphilis data to match the original format after it's been converted from FHIR JSON. For now, do the remaining transformations in a third file.
+
+**Schedule:** Daily
+
+
+```{r}
+remotes::install_github("ReverieNB/PHinfo")
+```
+
+
+```{r}
+library(tidyverse)
+library(PHinfo)
+```
+
+
+```{r}
+raw <- "/dbfs/mnt/phmdw/Raw/PublicHealth/InfectiousDiseases/SyphilisProvisional/Daily Files/"
+refined <- "/dbfs/mnt/phmdw/Refined/PublicHealth/InfectiousDiseases/SyphilisProvisional/"
+geo <- "/dbfs/mnt/phmdw/Raw/PublicHealth/InfectiousDiseases/SyphilisProvisional/Geocoding/"
+phcs <- "/dbfs/mnt/phmdw/Raw/PublicHealth/PHCS/Syphilis Provisional/"
+
+new_file <- list.files(raw, pattern = "fhir_syphilis_data") |>
+  tibble(file = _) |>
+  mutate(date = ymd(str_remove_all(file, "^.*_|\\.csv"))) |>
+  filter(date == max(date)) |>
+  pull(file)
+
+new_file
+```
+
+
+```{r}
+raw_data <- read_csv(str_c(raw, new_file),
+         #Select and rename columns
+         col_select = c(
+          case_id = id, case_modification_date, first_name, last_name, syphcode, age, age_units, birth_date, city, county_name = county, zip, disease, ethnc_code = ethnicity, 
+          facility_doing_the_reporting, sex = gender, gender_detail, partner_female = Femalesexpartners, partner_male = Malesexpartners, 
+          partner_transgender_fm = TransgenderFMsexpartners, partner_transgender_mf = TransgenderMFsexpartners, partner_unknown = `SexPartners'genderunknown`,
+          preg = Pregnantattimeofdiagnosis, race, regimen_start_date1 = regimen_start_date, site, specimen_date, street_1, street_2, treatment_regimen),
+         #Specify column types
+         col_types = c(
+          id = "c", 
+          case_modification_date = "T",
+          first_name = "c", 
+          last_name = "c",
+          syphcode = "c",
+          age = "d",
+          age_units = "c",
+          birth_date = "D",
+          city = "c",
+          county = "c",
+          zip = "c",
+          disease = "c",
+          ethnicity = "c",
+          facility_doing_the_reporting = "c",
+          gender = "c",
+          gender_detail = "c",
+          Femalesexpartners = "c",
+          Malesexpartners = "c",
+          TransgenderFMsexpartners = "c",
+          TransgenderMFsexpartners = "c",
+          "SexPartners'genderunknown" = "c",
+          Pregnantattimeofdiagnosis = "c",
+          race = "c",
+          regimen_start_date = "D",
+          site = "c",
+          specimen_date = "D",
+          street_1 = "c",
+          street_2 = "c",
+          treatment_regimen = "c"))
+```
+
+
+```{r}
+#syphilis ytd has actual NA, while the previous files have placeholders or blank. what is preferred? going to match the 2022 format for now
+aligned_data <- raw_data |>
+  #Multiple values are concatenated in the query script -- separate
+  separate_wider_delim(race, delim = ";;", names = c("race_code1", "race_code2", "race_code3"), too_few = "align_start") |> 
+  separate_wider_delim(treatment_regimen, delim = ";;", names = c("treatment_regimen1", "treatment_regimen_other1"), too_few = "align_start") |> 
+  separate_wider_delim(site, delim = ";;", names = c("site1", "site2"), too_few = "align_start") |> 
+  #Convert variables to match their original formats/formats created in the original transformation script
+  mutate(ethnc_code = case_when( 
+          ethnc_code == "Hispanic or Latino" ~ 1,
+          ethnc_code == "Non Hispanic or Latino" ~ 2,
+          ethnc_code == "asked but unknown" ~ 9,
+          ethnc_code == "Unknown" ~ 9),
+
+        sex = case_when(
+          sex == "male" ~ 1,
+          sex == "female" ~ 2,
+          sex == "other" ~ 9),
+
+        gender_detail = case_when(
+          gender_detail == "M_F" ~ "M-F",
+          gender_detail == "F_M" ~ "F-M"),
+
+        preg = case_when(
+          preg == "YES" ~ 1,
+          preg == "NO" ~ 2,
+          preg == "UNK" ~ 9),
+
+        syphcode = case_when(
+          syphcode == "SYPH_PRIMARY" ~ 1,
+          syphcode == "SYPH_SECONDARY" ~ 2,
+          syphcode == "SYPH_EARLY_LATENT" ~ 3,
+          syphcode == "SYPH_CONG" ~ 6,
+          syphcode == "SYPH_UNKNOWN_OR_LATE" ~ 4), #map these cases to late_latent (4) original value
+
+        across(starts_with("race_code"), ~case_when(            
+          . == "White" ~ 1,
+          . == "Black or African American" ~ 2,
+          . == "American Indian or Alaska Native" ~ 3,
+          . == "Asian" ~ 4,
+          . == "Native Hawaiian or Other Pacific Islander" ~ 4, #combine into Asian/PI to match original
+          . == "Other Race" ~ 5,
+          . == "" | is.na(.) ~ 9)),
+
+        across(starts_with("site"), ~case_when( #likely want to add a missing placeholder (9/99?) so NA returns an error here too
+          as.numeric(.) == 6 ~ 10, #blood
+          as.numeric(.) == 86 ~ 11, #CSV
+          as.numeric(.) == 94 ~ 5,
+          is.na(.) ~ NA)), #other
+
+        across(starts_with("partner_"), ~if_else(. == "Y", 1, 9)),
+        across(starts_with("street"), ~str_squish(.)),
+        across(contains("treatment_reg"), ~str_to_title(.)),
+        case_modification_date = as.Date(case_modification_date),
+        zip = str_sub(zip, 1, 5),
+        age_units = str_to_title(age_units))
+```
+
+
+```{r}
+validated_data <- aligned_data |>
+  #There are some cases where the same person (first, last, dob) has multiple rows/ids. In all cases, one record is more updated than the other
+  #Idk why new records are created versus the old ones being updated - will reach out to MDH.
+  #For now, just take the more recent one.
+  mutate(identity = str_c(first_name, last_name, birth_date)) |>
+  filter(case_modification_date == max(case_modification_date), .by = identity) |>
+  filter(case_id == max(case_id), .by = identity) |>
+  expect_values(list(sex = c(1, 2, 9),
+                     race_code1 = c(1, 2, 3, 4, 5, 9),
+                     race_code2 = c(1, 2, 3, 4, 5, 9),
+                     race_code3 = c(1, 2, 3, 4, 5, 9),
+                     ethnc_code = c(1, 2, 9),
+                     syphcode = c(1, 2, 3, 4, 6),
+                     county_name = "Hennepin County",
+                     disease = "SYPHILIS")) |>
+  expect_values(list(site1 = c(10, 11, 5)), na_accept = TRUE) |>
+  expect_missing(list(case_id = 0, first_name = 0, last_name = 0, birth_date = 0, ethnc_code = 0, race_code1 = 0, race_code2 = 0, race_code3 = 0)) |>
+  expect_unique("case_id") |>
+  check_expectations(fail = TRUE) |>
+  select(-identity)
+```
+
+
+```{r}
+mini_skim(validated_data)
+```
+
+
+```{r}
+#Before the FHIR process this was performed in a separate script
+for_geo <- validated_data |>
+  select(case_id, street_1, city, zip) |>
+  fix_city("city")
+
+#Print city names that were fixed
+print(validated_data$city[!str_to_upper(validated_data$city) %in% for_geo$city])
+```
+
+
+```{r}
+#Write out this list for Emily. She will use it to query Epic data that we will send to MDH as part of the Phase II project.
+epic_list <- validated_data |>
+  select(last_name, first_name, case_id, birth_date, specimen_date)
+
+write_csv(epic_list, str_c(phcs, "syphilis_patients_for_match.csv"))
+```
+
+
+```{r}
+#The data can't go through the Trusted data cleaning before being geocoded.
+#Kelzee will do this manually, so that final stage of data cleaning is still manual.
+write_rds(validated_data, str_c(refined, "fhir_syphilis_aligned.rds"))
+
+#Also save data for geocoding - include all years in a single file
+write_csv(for_geo, str_c(geo, "syphilis_ytd_for_geo.csv"))
+```
+
